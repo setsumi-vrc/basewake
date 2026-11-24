@@ -1,23 +1,14 @@
 //! The resident app: controller + tray + window + IPC server + SteamVR session, wired together.
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
-
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::UI::WindowsAndMessaging::{
-    IsIconic, PostMessageW, PostThreadMessageW, SW_HIDE, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow,
-    WM_CLOSE, WM_QUIT,
-};
 
 use crate::cli::{self, Cmd};
 use crate::engine::{self, Handle};
 use crate::ipc;
 use crate::vr::{self, VrStatus};
-
-/// Thread message that tells the tray thread to redraw its icon/tooltip.
-pub const WM_TRAY_REFRESH: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartMode {
@@ -27,6 +18,14 @@ pub enum StartMode {
     SteamVr,
 }
 
+/// Something only the UI thread can do, asked for from another thread (IPC, SteamVR, tray).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiRequest {
+    ShowWindow,
+    HideWindow,
+    Quit,
+}
+
 /// Shared by every thread of the app.
 pub struct AppCtl {
     pub handle: Handle,
@@ -34,23 +33,16 @@ pub struct AppCtl {
     /// Set when something the VR dashboard shows has changed.
     pub vr_dirty: AtomicBool,
     vr_running: AtomicBool,
-    hwnd: AtomicIsize,
-    tray_thread: AtomicU32,
     quitting: AtomicBool,
+    requests: Mutex<Vec<UiRequest>>,
     egui: OnceLock<eframe::egui::Context>,
 }
 
 impl AppCtl {
-    /// Something changed: repaint the window, refresh the tray and the VR panel.
+    /// Something changed: repaint the window (which also refreshes the tray) and the VR panel.
     pub fn notify(&self) {
         if let Some(ctx) = self.egui.get() {
             ctx.request_repaint();
-        }
-        let tid = self.tray_thread.load(Ordering::Acquire);
-        if tid != 0 {
-            unsafe {
-                let _ = PostThreadMessageW(tid, WM_TRAY_REFRESH, WPARAM(0), LPARAM(0));
-            }
         }
         self.vr_dirty.store(true, Ordering::Release);
     }
@@ -64,46 +56,28 @@ impl AppCtl {
         self.vr.read().unwrap().clone()
     }
 
-    fn hwnd(&self) -> Option<HWND> {
-        let h = self.hwnd.load(Ordering::Acquire);
-        (h != 0).then_some(HWND(h as *mut _))
-    }
-
-    pub(crate) fn set_window(&self, hwnd: isize, ctx: eframe::egui::Context) {
-        self.hwnd.store(hwnd, Ordering::Release);
+    pub(crate) fn set_egui(&self, ctx: eframe::egui::Context) {
         let _ = self.egui.set(ctx);
     }
 
-    pub(crate) fn set_tray_thread(&self, tid: u32) {
-        self.tray_thread.store(tid, Ordering::Release);
-    }
-
-    /// Shows and focuses the window (works from any thread, even while eframe is idle).
-    pub fn show_window(&self) {
-        if let Some(h) = self.hwnd() {
-            unsafe {
-                if IsIconic(h).as_bool() {
-                    let _ = ShowWindow(h, SW_RESTORE);
-                } else {
-                    let _ = ShowWindow(h, SW_SHOW);
-                }
-                let _ = SetForegroundWindow(h);
-            }
-        }
+    fn request(&self, r: UiRequest) {
+        self.requests.lock().unwrap().push(r);
         if let Some(ctx) = self.egui.get() {
             ctx.request_repaint();
         }
+    }
+
+    /// Requests waiting for the UI thread.
+    pub(crate) fn take_requests(&self) -> Vec<UiRequest> {
+        std::mem::take(&mut *self.requests.lock().unwrap())
+    }
+
+    /// Shows and focuses the window (from any thread).
+    pub fn show_window(&self) {
+        self.request(UiRequest::ShowWindow);
         // The window has no refresh button: re-read the stations whenever it is opened.
         if self.handle.snapshot().activity.is_none() {
             self.handle.send(engine::Command::Refresh);
-        }
-    }
-
-    pub fn hide_window(&self) {
-        if let Some(h) = self.hwnd() {
-            unsafe {
-                let _ = ShowWindow(h, SW_HIDE);
-            }
         }
     }
 
@@ -111,27 +85,13 @@ impl AppCtl {
         self.quitting.load(Ordering::Acquire)
     }
 
-    /// Closes the app: removes the tray icon and closes the window.
+    /// Closes the app: the window closes, which also removes the tray icon.
     pub fn quit(&self) {
         if self.quitting.swap(true, Ordering::AcqRel) {
             return;
         }
         tracing::info!("quitting");
-        let tid = self.tray_thread.load(Ordering::Acquire);
-        if tid != 0 {
-            unsafe {
-                let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
-            }
-        }
-        if let Some(h) = self.hwnd() {
-            unsafe {
-                let _ = PostMessageW(Some(h), WM_CLOSE, WPARAM(0), LPARAM(0));
-            }
-        }
-        if let Some(ctx) = self.egui.get() {
-            ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Close);
-            ctx.request_repaint();
-        }
+        self.request(UiRequest::Quit);
         // Safety net in case the window never gets to process the close.
         thread::spawn(|| {
             thread::sleep(Duration::from_secs(4));
@@ -162,6 +122,10 @@ impl AppCtl {
         match request {
             "show" => {
                 self.show_window();
+                (0, String::new())
+            }
+            "hide" => {
+                self.request(UiRequest::HideWindow);
                 (0, String::new())
             }
             "quit" => {
@@ -211,9 +175,8 @@ pub fn run(mode: StartMode) -> i32 {
         vr: RwLock::new(VrStatus::default()),
         vr_dirty: AtomicBool::new(true),
         vr_running: AtomicBool::new(false),
-        hwnd: AtomicIsize::new(0),
-        tray_thread: AtomicU32::new(0),
         quitting: AtomicBool::new(false),
+        requests: Mutex::new(Vec::new()),
         egui: OnceLock::new(),
     });
     {
@@ -228,7 +191,6 @@ pub fn run(mode: StartMode) -> i32 {
         let c = ctl.clone();
         server.serve(Arc::new(move |req: &str| c.handle_ipc(req)));
     }
-    crate::desktop::tray::spawn(ctl.clone());
     vr::manifest::refresh_status_async(ctl.clone());
 
     if mode == StartMode::SteamVr {

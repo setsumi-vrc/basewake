@@ -1,128 +1,131 @@
-//! Tray icon on its own thread with its own message loop, so it keeps working while the window
-//! is hidden and eframe is idle.
+//! Tray icon: its colour shows the state at a glance; left click shows or hides the window.
+//!
+//! Right click opens the app's own popup on Windows and macOS. Linux tray hosts
+//! (StatusNotifierItem) don't report where a click happened and Wayland doesn't let apps place
+//! windows, so there it opens a native menu with the same items instead.
 
-use std::sync::Arc;
-use std::thread;
+use std::sync::mpsc::{Receiver, Sender, channel};
 
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use eframe::egui;
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use windows::Win32::System::Threading::GetCurrentThreadId;
-use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, MSG, PM_NOREMOVE, PeekMessageW, TranslateMessage, WM_USER,
-};
 
-use crate::app::{AppCtl, WM_TRAY_REFRESH};
-use crate::engine::{Command, Target};
+use crate::engine::Snapshot;
 use crate::ui::{self, icons::Tone};
 
 const ICON_SIZE: u32 = 32;
 
+pub enum TrayAction {
+    ToggleWindow,
+    /// Physical screen position of the click.
+    OpenPopup { x: f64, y: f64 },
+    /// From the Linux tray menu.
+    #[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
+    ShowWindow,
+    #[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
+    AllOn,
+    #[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
+    AllOff,
+    #[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
+    Scan,
+    #[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
+    Quit,
+}
+
+pub struct Tray {
+    icon: TrayIcon,
+    pub events: Receiver<TrayAction>,
+    shown: Option<(Tone, String)>,
+    #[cfg(not(any(windows, target_os = "macos")))]
+    _menu: linux::Menu,
+}
+
 fn icon(tone: Tone) -> Option<Icon> {
-    Icon::from_rgba(ui::icons::rgba(tone, ICON_SIZE), ICON_SIZE, ICON_SIZE).ok()
+    Icon::from_rgba(ui::icons::tray_rgba(tone, ICON_SIZE), ICON_SIZE, ICON_SIZE).ok()
 }
 
-pub fn spawn(ctl: Arc<AppCtl>) {
-    thread::Builder::new()
-        .name("tray".into())
-        .spawn(move || {
-            if let Err(e) = run(&ctl) {
-                tracing::error!("tray icon failed: {e:#}");
+impl Tray {
+    /// Must be created on the main thread (the one running the window).
+    pub fn new(ctx: &egui::Context) -> Option<Self> {
+        let (tx, rx) = channel();
+        let send = {
+            let ctx = ctx.clone();
+            move |tx: &Sender<TrayAction>, a: TrayAction| {
+                let _ = tx.send(a);
+                ctx.request_repaint();
             }
-            ctl.set_tray_thread(0);
-        })
-        .expect("spawn tray thread");
-}
+        };
 
-fn run(ctl: &Arc<AppCtl>) -> anyhow::Result<()> {
-    unsafe {
-        // Create this thread's message queue before anyone posts to it.
-        let mut msg = MSG::default();
-        let _ = PeekMessageW(&mut msg, None, WM_USER, WM_USER, PM_NOREMOVE);
-    }
-
-    let open = MenuItem::new("Open Basewake", true, None);
-    let on = MenuItem::new("Turn all on", true, None);
-    let off = MenuItem::new("Turn all off", true, None);
-    let scan = MenuItem::new("Scan for base stations", true, None);
-    let quit = MenuItem::new("Quit", true, None);
-    let menu = Menu::new();
-    menu.append_items(&[
-        &open,
-        &PredefinedMenuItem::separator(),
-        &on,
-        &off,
-        &scan,
-        &PredefinedMenuItem::separator(),
-        &quit,
-    ])?;
-
-    let (tone, tip) = describe(ctl);
-    let tray: TrayIcon = TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
-        .with_menu_on_left_click(false)
-        .with_tooltip(&tip)
-        .with_icon(icon(tone).ok_or_else(|| anyhow::anyhow!("bad icon"))?)
-        .build()?;
-
-    {
-        let c = ctl.clone();
-        TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
-            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e {
-                c.show_window();
-            }
-        }));
-    }
-    {
-        let c = ctl.clone();
-        let ids = (open.id().clone(), on.id().clone(), off.id().clone(), scan.id().clone(), quit.id().clone());
-        MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
-            let id = &e.id;
-            if *id == ids.0 {
-                c.show_window();
-            } else if *id == ids.1 {
-                c.handle.send(Command::PowerAll(Target::On));
-            } else if *id == ids.2 {
-                c.handle.send(Command::PowerAll(Target::Off));
-            } else if *id == ids.3 {
-                c.handle.send(Command::Scan);
-            } else if *id == ids.4 {
-                c.quit();
-            }
-        }));
-    }
-
-    ctl.set_tray_thread(unsafe { GetCurrentThreadId() });
-    let mut last = (tone, tip);
-    unsafe {
-        let mut msg = MSG::default();
-        // GetMessage returns 0 on WM_QUIT and -1 on error.
-        while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
-            if msg.hwnd.is_invalid() && msg.message == WM_TRAY_REFRESH {
-                let now = describe(ctl);
-                if now != last {
-                    if now.0 != last.0 {
-                        let _ = tray.set_icon(icon(now.0));
+        {
+            let tx = tx.clone();
+            let send = send.clone();
+            TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
+                let action = match e {
+                    TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } => {
+                        Some(TrayAction::ToggleWindow)
                     }
-                    let _ = tray.set_tooltip(Some(&now.1));
-                    last = now;
+                    TrayIconEvent::Click {
+                        button: MouseButton::Right,
+                        button_state: MouseButtonState::Up,
+                        position,
+                        ..
+                    } => Some(TrayAction::OpenPopup { x: position.x, y: position.y }),
+                    _ => None,
+                };
+                if let Some(a) = action {
+                    send(&tx, a);
                 }
-                continue;
-            }
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            }));
+        }
+
+        let builder = TrayIconBuilder::new()
+            .with_tooltip("Basewake")
+            .with_icon(icon(Tone::Off)?)
+            .with_menu_on_left_click(false);
+
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            let _ = (&send, &tx);
+            let icon = match builder.with_menu_on_right_click(false).build() {
+                Ok(i) => i,
+                Err(e) => {
+                    tracing::error!("tray icon: {e}");
+                    return None;
+                }
+            };
+            Some(Self { icon, events: rx, shown: None })
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            let menu = linux::Menu::new(move |a| send(&tx, a));
+            let icon = match builder.with_menu(Box::new(menu.menu.clone())).build() {
+                Ok(i) => i,
+                Err(e) => {
+                    tracing::error!("tray icon: {e}");
+                    return None;
+                }
+            };
+            Some(Self { icon, events: rx, shown: None, _menu: menu })
         }
     }
-    TrayIconEvent::set_event_handler(None::<fn(TrayIconEvent)>);
-    MenuEvent::set_event_handler(None::<fn(MenuEvent)>);
-    drop(tray); // removes the icon from the taskbar
-    Ok(())
+
+    /// Updates the icon and tooltip, only when they change.
+    pub fn update(&mut self, snap: &Snapshot, steamvr: bool) {
+        let now = describe(snap, steamvr);
+        if self.shown.as_ref() == Some(&now) {
+            return;
+        }
+        if self.shown.as_ref().map(|s| s.0) != Some(now.0) {
+            let _ = self.icon.set_icon(icon(now.0));
+        }
+        let _ = self.icon.set_tooltip(Some(&now.1));
+        self.shown = Some(now);
+    }
 }
 
 /// Icon tone + tooltip for the current state.
-fn describe(ctl: &AppCtl) -> (Tone, String) {
-    let snap = ctl.handle.snapshot();
+fn describe(snap: &Snapshot, steamvr: bool) -> (Tone, String) {
     let (on, total) = snap.powered_count();
-    let tone = ui::overall_tone(&snap);
+    let tone = ui::overall_tone(snap);
     let mut tip = if total == 0 {
         "Basewake · no base stations".to_string()
     } else {
@@ -131,8 +134,52 @@ fn describe(ctl: &AppCtl) -> (Tone, String) {
     if let Some(a) = &snap.activity {
         tip = format!("{tip}\n{a}");
     }
-    if ctl.vr_status().connected {
+    if steamvr {
         tip.push_str("\nSteamVR running");
     }
     (tone, tip)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+mod linux {
+    use tray_icon::menu::{Menu as NativeMenu, MenuEvent, MenuItem, PredefinedMenuItem};
+
+    use super::TrayAction;
+
+    pub struct Menu {
+        pub menu: NativeMenu,
+    }
+
+    impl Menu {
+        pub fn new(send: impl Fn(TrayAction) + Send + Sync + 'static) -> Self {
+            let open = MenuItem::new("Open window", true, None);
+            let on = MenuItem::new("Turn all on", true, None);
+            let off = MenuItem::new("Turn all off", true, None);
+            let scan = MenuItem::new("Scan for base stations", true, None);
+            let quit = MenuItem::new("Quit Basewake", true, None);
+            let menu = NativeMenu::new();
+            let _ = menu.append_items(&[
+                &open,
+                &PredefinedMenuItem::separator(),
+                &on,
+                &off,
+                &scan,
+                &PredefinedMenuItem::separator(),
+                &quit,
+            ]);
+            let ids = [open.id().clone(), on.id().clone(), off.id().clone(), scan.id().clone(), quit.id().clone()];
+            MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
+                let a = match ids.iter().position(|id| *id == e.id) {
+                    Some(0) => TrayAction::ShowWindow,
+                    Some(1) => TrayAction::AllOn,
+                    Some(2) => TrayAction::AllOff,
+                    Some(3) => TrayAction::Scan,
+                    Some(4) => TrayAction::Quit,
+                    _ => return,
+                };
+                send(a);
+            }));
+            Self { menu }
+        }
+    }
 }

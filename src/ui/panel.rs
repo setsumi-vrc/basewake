@@ -26,6 +26,46 @@ pub struct PanelState {
 }
 
 /// Draws the whole panel (no scrolling) and returns the height it needs, in points.
+impl PanelState {
+    /// A pending switch position expires shortly after the controller is idle again.
+    pub fn expire_pending(&mut self, ctx: &egui::Context, busy: bool) {
+        let now = Instant::now();
+        for p in self.pending.values_mut() {
+            if busy {
+                p.1 = now;
+            }
+        }
+        self.pending.retain(|_, (_, at)| at.elapsed() < Duration::from_millis(300));
+        if !self.pending.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+}
+
+/// The switch for every managed base station at once. Moves as soon as it is clicked.
+pub fn master_switch(ui: &mut egui::Ui, ctl: &AppCtl, st: &mut PanelState, snap: &Snapshot, busy: bool) {
+    let (on, total) = snap.powered_count();
+    let shown = st.pending.get(&None).map(|p| p.0).unwrap_or(total > 0 && on == total);
+    let resp = switch(ui, shown, total > 0 && !busy, "All base stations")
+        .on_hover_text(if shown { "Turn all off" } else { "Turn all on" });
+    if resp.clicked() {
+        let target = !shown;
+        st.pending.insert(None, (target, Instant::now()));
+        ctl.handle.send(Command::PowerAll(if target { Target::On } else { Target::Off }));
+    }
+}
+
+/// One base station's switch. Moves as soon as it is clicked.
+pub fn station_switch(ui: &mut egui::Ui, ctl: &AppCtl, st: &mut PanelState, s: &StationStatus, busy: bool) {
+    let mac = s.mac;
+    let shown = st.pending.get(&Some(mac)).map(|p| p.0).unwrap_or(s.state.is_powered());
+    if switch(ui, shown, !busy, &display_name(s)).clicked() {
+        let target = !shown;
+        st.pending.insert(Some(mac), (target, Instant::now()));
+        ctl.handle.send(Command::Power(mac, if target { Target::On } else { Target::Off }));
+    }
+}
+
 pub fn draw(ui: &mut egui::Ui, ctl: &Arc<AppCtl>, st: &mut PanelState) -> f32 {
     egui::Frame::new()
         .inner_margin(egui::Margin { left: 22, right: 22, top: 20, bottom: 22 })
@@ -44,17 +84,7 @@ fn draw_inner(ui: &mut egui::Ui, ctl: &Arc<AppCtl>, st: &mut PanelState) {
     let vr = ctl.vr_status();
     let busy = snap.activity.is_some();
 
-    // A pending switch position expires shortly after the controller is idle again.
-    let now = Instant::now();
-    for p in st.pending.values_mut() {
-        if busy {
-            p.1 = now;
-        }
-    }
-    st.pending.retain(|_, (_, at)| at.elapsed() < Duration::from_millis(300));
-    if !st.pending.is_empty() {
-        ui.ctx().request_repaint_after(Duration::from_millis(100));
-    }
+    st.expire_pending(ui.ctx(), busy);
 
     header(ui, ctl, st, &snap, &vr, busy);
     problems(ui, &snap);
@@ -88,7 +118,6 @@ fn is_scanning(snap: &Snapshot) -> bool {
 
 fn header(ui: &mut egui::Ui, ctl: &Arc<AppCtl>, st: &mut PanelState, snap: &Snapshot, vr: &VrStatus, busy: bool) {
     let (on, total) = snap.powered_count();
-    let all_on = total > 0 && on == total;
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
             ui.label(RichText::new("Base stations").text_style(egui::TextStyle::Heading).color(TEXT));
@@ -105,14 +134,7 @@ fn header(ui: &mut egui::Ui, ctl: &Arc<AppCtl>, st: &mut PanelState, snap: &Snap
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             // Line up with the station switches, which sit left of each row's "more" button.
             ui.add_space(26.0 + 8.0);
-            let shown = st.pending.get(&None).map(|p| p.0).unwrap_or(all_on);
-            let resp = switch(ui, shown, total > 0 && !busy, "All base stations")
-                .on_hover_text(if shown { "Turn all off" } else { "Turn all on" });
-            if resp.clicked() {
-                let target = !shown;
-                st.pending.insert(None, (target, Instant::now()));
-                ctl.handle.send(Command::PowerAll(if target { Target::On } else { Target::Off }));
-            }
+            master_switch(ui, ctl, st, snap, busy);
         });
     });
 }
@@ -168,7 +190,7 @@ fn divider(ui: &mut egui::Ui) {
     ui.painter().hline(rect.x_range(), rect.center().y, egui::Stroke::new(1.0, HAIRLINE));
 }
 
-fn display_name(s: &StationStatus) -> String {
+pub fn display_name(s: &StationStatus) -> String {
     if s.name.trim().is_empty() { s.mac.to_string() } else { s.name.clone() }
 }
 
@@ -182,7 +204,7 @@ fn capitalize(s: &str) -> String {
     c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
 }
 
-fn state_text(s: &StationStatus) -> (&'static str, egui::Color32) {
+pub fn state_text(s: &StationStatus) -> (&'static str, egui::Color32) {
     if let Some(e) = &s.error {
         return (if is_unreachable(e) { "Unreachable" } else { "Error" }, DANGER);
     }
@@ -259,13 +281,7 @@ fn station_row(ui: &mut egui::Ui, ctl: &Arc<AppCtl>, st: &mut PanelState, s: &St
             menu(ctl, st, s, &more, &row_resp);
             ui.add_space(8.0);
 
-            let shown = st.pending.get(&Some(mac)).map(|p| p.0).unwrap_or(s.state.is_powered());
-            let resp = switch(ui, shown, !busy, &display_name(s));
-            if resp.clicked() {
-                let target = !shown;
-                st.pending.insert(Some(mac), (target, Instant::now()));
-                ctl.handle.send(Command::Power(mac, if target { Target::On } else { Target::Off }));
-            }
+            station_switch(ui, ctl, st, s, busy);
             ui.add_space(6.0);
 
             if s.busy {
