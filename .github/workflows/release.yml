@@ -35,6 +35,7 @@ jobs:
           $name = "Basewake-${{ github.ref_name }}-${{ matrix.target }}"
           New-Item -ItemType Directory $name | Out-Null
           Copy-Item target/release/basewake.exe, target/release/basewakectl.exe, target/release/openvr_api.dll, install.ps1, README.md, CHANGELOG.md, LICENSE $name
+          Copy-Item third_party/openvr-2.12.14/LICENSE "$name/openvr_api.LICENSE.txt"
           Compress-Archive $name "$name.zip"
           "ASSET=$name.zip" >> $env:GITHUB_ENV
 
@@ -44,7 +45,10 @@ jobs:
           name="Basewake-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir "$name"
           cp target/release/basewake target/release/basewakectl README.md CHANGELOG.md LICENSE "$name"/
-          if [ -f target/release/libopenvr_api.so ]; then cp target/release/libopenvr_api.so "$name"/; fi
+          if [ -f target/release/libopenvr_api.so ]; then
+            cp target/release/libopenvr_api.so "$name"/
+            cp third_party/openvr-2.12.14/LICENSE "$name/openvr_api.LICENSE.txt"
+          fi
           tar czf "$name.tar.gz" "$name"
           echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
 

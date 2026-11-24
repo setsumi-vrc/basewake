@@ -20,7 +20,11 @@ First release.
   remove from each row's menu.
 - Settings in the window: turn off as Sleep or Standby, start with SteamVR, look for new base
   stations at start, manage new ones automatically, quit when SteamVR closes.
-- Tray icon that shows the state at a glance.
+- Tray icon that shows the state at a glance. Click it to show the window; right-click for a
+  quick panel with the switches, *Scan for base stations*, *Open window* and *Quit*.
+- Own title bar with links to the GitHub repo, X and the issue tracker.
+- Runs on Windows, Linux (with SteamVR) and macOS (window, tray and console commands; SteamVR
+  doesn't run there). Linux and macOS are built and tested in CI but not yet on real hardware.
 - Panel in the SteamVR dashboard with the same controls.
 - `basewakectl` console commands: `on`, `off`, `toggle`, `status`, `scan`, `install`,
   `uninstall`, with real exit codes.

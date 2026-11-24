@@ -1,13 +1,21 @@
-﻿# Builds Basewake and copies it to %LOCALAPPDATA%\Programs\Basewake.
-# Usage:  .\install.ps1            (build + copy)
+﻿# Copies Basewake to %LOCALAPPDATA%\Programs\Basewake: from the release zip it sits in, or from a
+# fresh build when run in the source folder.
+# Usage:  .\install.ps1            (copy)
 #         .\install.ps1 -Register  (also register as a SteamVR startup app; SteamVR is contacted)
 param([switch]$Register)
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
-# cargo writes progress to stderr; run it through cmd so Windows PowerShell does not treat that as an error.
-cmd /c "cargo build --release 2>&1"
-if ($LASTEXITCODE -ne 0) { throw "build failed" }
+if (Test-Path 'Cargo.toml') {
+    # cargo writes progress to stderr; run it through cmd so Windows PowerShell does not treat that as an error.
+    cmd /c "cargo build --release 2>&1"
+    if ($LASTEXITCODE -ne 0) { throw "build failed" }
+    $src = 'target\release'
+    $license = 'third_party\openvr-2.12.14\LICENSE'
+} else {
+    $src = '.'
+    $license = 'openvr_api.LICENSE.txt'
+}
 
 $dest = Join-Path $env:LOCALAPPDATA 'Programs\Basewake'
 New-Item -ItemType Directory -Force $dest | Out-Null
@@ -27,9 +35,9 @@ if (Get-Process basewake -ErrorAction SilentlyContinue) {
 }
 
 foreach ($f in 'basewake.exe', 'basewakectl.exe', 'openvr_api.dll') {
-    Copy-Item "target\release\$f" $dest -Force
+    Copy-Item (Join-Path $src $f) $dest -Force
 }
-Copy-Item 'third_party\openvr-2.12.14\LICENSE' "$dest\openvr_api.LICENSE.txt" -Force
+Copy-Item $license "$dest\openvr_api.LICENSE.txt" -Force
 Write-Host "Installed to $dest"
 
 if ($Register) {

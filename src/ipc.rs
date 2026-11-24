@@ -187,8 +187,7 @@ mod imp {
 
     pub(super) fn send_to(path: &Path, request: &str) -> Option<(i32, String)> {
         let mut s = UnixStream::connect(path).ok()?;
-        s.write_all(format!("{request}
-").as_bytes()).ok()?;
+        s.write_all(format!("{request}\n").as_bytes()).ok()?;
         let mut text = String::new();
         s.read_to_string(&mut text).ok()?;
         super::parse_reply(&text)
@@ -245,10 +244,12 @@ mod imp {
             return;
         }
         let request = line.trim();
+        if request.is_empty() {
+            return; // a liveness check from `claim`
+        }
         tracing::info!("ipc request: {request}");
         let (code, text) = handler(request);
-        let _ = stream.write_all(format!("EXIT {code}
-{text}").as_bytes());
+        let _ = stream.write_all(format!("EXIT {code}\n{text}").as_bytes());
         // Dropping the stream closes it; the client then sees end-of-file.
     }
 }

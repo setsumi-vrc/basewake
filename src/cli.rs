@@ -79,8 +79,7 @@ pub const EXIT_FAILED: i32 = 1;
 /// Returns (exit code, text to print).
 pub fn run(cmd: Cmd, allow_forward: bool) -> (i32, String) {
     if cmd.needs_instance() {
-        return crate::ipc::send(cmd.as_str()).unwrap_or((EXIT_OK, "Basewake is not running.
-".into()));
+        return crate::ipc::send(cmd.as_str()).unwrap_or((EXIT_OK, "Basewake is not running.\n".into()));
     }
     if allow_forward && cmd.uses_bluetooth()
         && let Some(reply) = crate::ipc::send(cmd.as_str()) {

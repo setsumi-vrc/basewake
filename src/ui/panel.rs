@@ -341,10 +341,10 @@ fn settings(ui: &mut egui::Ui, ctl: &Arc<AppCtl>, cfg: &Config, vr: &VrStatus) {
         }
     });
 
+    bool_row(ui, ctl, "Manage new base stations automatically", cfg.auto_enable_new, |c, v| c.auto_enable_new = v);
     if crate::vr::SUPPORTED {
         steamvr_settings(ui, ctl, cfg, vr);
     }
-    bool_row(ui, ctl, "Manage new base stations automatically", cfg.auto_enable_new, |c, v| c.auto_enable_new = v);
 
     ui.add_space(14.0);
     if text_button(ui, "Open settings and logs folder", true).clicked() {

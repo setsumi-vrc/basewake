@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 
 use super::station::Mac;
 
@@ -49,6 +49,7 @@ pub use win::WinRadio;
 #[cfg(windows)]
 mod win {
     use super::*;
+    use anyhow::bail;
     use windows::Devices::Bluetooth::Advertisement::{
         BluetoothLEAdvertisementReceivedEventArgs, BluetoothLEAdvertisementWatcher, BluetoothLEScanningMode,
     };

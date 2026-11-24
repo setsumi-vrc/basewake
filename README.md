@@ -9,10 +9,31 @@ icon and a panel in the SteamVR dashboard.
 - Switch each one on or off by hand, rename it, or leave it out.
 - Turn off as **Sleep** (fully off) or **Standby** (motor stopped, wakes faster).
 - Registers itself as a SteamVR startup app, so it needs no other launcher.
+- Tray icon in the state colour; click it to show the window, right-click for a quick panel with
+  every switch.
+
+## Download
+
+Get the zip for your system from [Releases](https://github.com/setsumi-vrc/basewake/releases).
+
+| System | SteamVR | Status |
+|---|---|---|
+| Windows 10/11 | yes | tested |
+| Linux (x86-64) | yes | builds and passes tests in CI; not yet tried on real hardware |
+| macOS (Apple silicon) | no (SteamVR doesn't run on macOS) | window, tray and console commands only; not yet tried on real hardware |
+
+Your computer needs Bluetooth LE that can reach the base stations.
 
 ## Install
 
-Windows (from source, needs [Rust](https://rustup.rs)):
+**Windows.** Unzip, then in that folder run
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1 -Register
+```
+
+It copies Basewake to `%LOCALAPPDATA%\Programs\Basewake` and starts it with SteamVR. From
+source (needs [Rust](https://rustup.rs)):
 
 ```powershell
 .\install.ps1             # build and copy to %LOCALAPPDATA%\Programs\Basewake
@@ -22,6 +43,14 @@ Windows (from source, needs [Rust](https://rustup.rs)):
 After registering, **SteamVR → Settings → Startup/Shutdown → Choose Startup Overlay Apps** lists
 "Basewake". If you used the old *Lighthouse Manager*, `-Register` replaces it and your settings
 and base stations carry over.
+
+**Linux.** Unzip to a folder you'll keep (for example `~/.local/opt/basewake`), keep
+`libopenvr_api.so` next to `basewake`, then run `./basewakectl install` once to start it with
+SteamVR. It uses BlueZ, so Bluetooth must be on and your user allowed to use it. The tray icon
+needs a StatusNotifier host (KDE has one; on GNOME add the AppIndicator extension).
+
+**macOS.** Unzip and run `basewake`. The first time, macOS asks for Bluetooth access. The binary
+isn't notarized, so you may need `xattr -d com.apple.quarantine basewake basewakectl` first.
 
 ## How it runs
 
@@ -36,7 +65,8 @@ Only one copy runs; opening it again shows the running one.
 ## Settings
 
 Everything is set in the window (or the SteamVR panel) and saved to `basewake.toml` in
-`%APPDATA%\Basewake`:
+`%APPDATA%\Basewake` (Windows), `~/.config/Basewake` (Linux) or
+`~/Library/Application Support/Basewake` (macOS):
 
 - **Turn off as**: Sleep (default) or Standby
 - **Start with SteamVR**
@@ -46,7 +76,9 @@ Everything is set in the window (or the SteamVR panel) and saved to `basewake.to
 - Per base station: a switch to turn it on or off now; the `···` menu (or right-click) to rename,
   stop or start managing it, or remove it. The switch next to the title covers all of them.
 
-Logs go to `%APPDATA%\Basewake\logs` (`BASEWAKE_LOG=debug` for more detail).
+Logs go to the `logs` folder next to it (`BASEWAKE_LOG=debug` for more detail). The window's
+title bar links to this repo, to [@setsumi_vrc](https://x.com/setsumi_vrc) and to the issue
+tracker.
 
 ## Building
 
@@ -54,6 +86,11 @@ Logs go to `%APPDATA%\Basewake\logs` (`BASEWAKE_LOG=debug` for more detail).
 cargo test
 cargo build --release
 ```
+
+On Windows Basewake talks to Bluetooth through WinRT; elsewhere through
+[btleplug](https://github.com/deviceplug/btleplug) (`BASEWAKE_BLE=btleplug` uses it on Windows
+too). macOS doesn't expose Bluetooth addresses, so there a base station is known by its
+`LHB-…` name.
 
 ```
 src/engine/   Bluetooth, controller (parallel, retries, deadlines), config, logging
