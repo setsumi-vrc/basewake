@@ -17,13 +17,13 @@ jobs:
             files: |
               target/release/basewake.exe
               target/release/basewakectl.exe
-              target/release/openvr_api.dll
+              third_party/openvr-2.12.14/openvr_api.dll
           - os: ubuntu-latest
             name: basewake-linux-x64
             files: |
               target/release/basewake
               target/release/basewakectl
-              target/release/libopenvr_api.so
+              third_party/openvr-2.12.14/libopenvr_api.so
           - os: macos-latest
             name: basewake-macos-arm64
             files: |

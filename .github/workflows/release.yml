@@ -1,12 +1,21 @@
 name: release
 
-# Push a tag like v0.1.0 to build all three systems and publish a release.
+# Push a tag like v0.1.0 to build all three systems and publish a release. To redo the release of
+# an existing tag (for example after fixing this workflow), run it by hand with that tag.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and publish, like v0.1.0
+        required: true
 
 permissions:
   contents: write
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   build:
@@ -23,18 +32,22 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --release
       - run: cargo build --release
 
+      # The OpenVR library comes straight from third_party/: build.rs only copies it into target/
+      # when its build script reruns, which a restored cache can skip.
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $name = "Basewake-${{ github.ref_name }}-${{ matrix.target }}"
+          $name = "Basewake-$env:TAG-${{ matrix.target }}"
           New-Item -ItemType Directory $name | Out-Null
-          Copy-Item target/release/basewake.exe, target/release/basewakectl.exe, target/release/openvr_api.dll, install.ps1, README.md, CHANGELOG.md, LICENSE $name
+          Copy-Item target/release/basewake.exe, target/release/basewakectl.exe, third_party/openvr-2.12.14/openvr_api.dll, install.ps1, README.md, CHANGELOG.md, LICENSE $name
           Copy-Item third_party/openvr-2.12.14/LICENSE "$name/openvr_api.LICENSE.txt"
           Compress-Archive $name "$name.zip"
           "ASSET=$name.zip" >> $env:GITHUB_ENV
@@ -42,11 +55,11 @@ jobs:
       - name: Package (Linux, macOS)
         if: runner.os != 'Windows'
         run: |
-          name="Basewake-${{ github.ref_name }}-${{ matrix.target }}"
+          name="Basewake-$TAG-${{ matrix.target }}"
           mkdir "$name"
           cp target/release/basewake target/release/basewakectl README.md CHANGELOG.md LICENSE "$name"/
-          if [ -f target/release/libopenvr_api.so ]; then
-            cp target/release/libopenvr_api.so "$name"/
+          if [ "$RUNNER_OS" = Linux ]; then
+            cp third_party/openvr-2.12.14/libopenvr_api.so "$name"/
             cp third_party/openvr-2.12.14/LICENSE "$name/openvr_api.LICENSE.txt"
           fi
           tar czf "$name.tar.gz" "$name"
@@ -62,19 +75,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
       - name: Release notes from CHANGELOG.md
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          awk -v v="$version" '
-            $0 ~ "^## \[" v "\]" { on = 1; next }
-            on && /^## \[/ { exit }
+          # The section for this version: from its "## [x.y.z]" heading to the next one.
+          awk -v h="## [${TAG#v}]" '
+            index($0, h) == 1 { on = 1; next }
+            on && index($0, "## [") == 1 { exit }
             on { print }
           ' CHANGELOG.md > notes.md
+          test -s notes.md
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.TAG }}
+          name: Basewake ${{ env.TAG }}
           files: dist/*
           body_path: notes.md
