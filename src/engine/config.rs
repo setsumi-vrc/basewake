@@ -74,7 +74,7 @@ impl Default for Config {
 }
 
 impl Config {
-    /// `%APPDATA%\Basewake`
+    /// `%APPDATA%\Basewake`, `~/.config/Basewake`, `~/Library/Application Support/Basewake`.
     pub fn dir() -> PathBuf {
         directories::BaseDirs::new()
             .map(|d| d.config_dir().join("Basewake"))

@@ -1,5 +1,7 @@
-//! Bluetooth LE access. `Radio` is the seam the controller talks to; `WinRadio` is the real
-//! implementation on top of the Windows Runtime Bluetooth APIs.
+//! Bluetooth LE access. `Radio` is the seam the controller talks to. On Windows the real one is
+//! `WinRadio` (Windows Runtime APIs, connects straight by address); on Linux and macOS it is
+//! `BtleRadio` (btleplug: BlueZ / CoreBluetooth). `BASEWAKE_BLE=btleplug` uses btleplug on
+//! Windows too, to test that path.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -32,8 +34,19 @@ pub trait Radio: Send + Sync + 'static {
 /// Name prefix that Lighthouse V2 base stations advertise.
 pub const LHB_PREFIX: &str = "LHB-";
 
+/// The radio for this system.
+pub fn default_radio() -> Arc<dyn Radio> {
+    #[cfg(windows)]
+    if std::env::var("BASEWAKE_BLE").as_deref() != Ok("btleplug") {
+        return Arc::new(win::WinRadio::new());
+    }
+    Arc::new(btle::BtleRadio::new())
+}
+
+#[cfg(windows)]
 pub use win::WinRadio;
 
+#[cfg(windows)]
 mod win {
     use super::*;
     use windows::Devices::Bluetooth::Advertisement::{
@@ -180,6 +193,178 @@ mod win {
             watcher.Stop()?;
             let map = found.lock().unwrap();
             Ok(map.values().filter(|d| d.name.starts_with(LHB_PREFIX)).cloned().collect())
+        }
+    }
+}
+
+mod btle {
+    use std::time::Instant;
+
+    use btleplug::api::{Central, Characteristic, Manager as _, Peripheral as _, ScanFilter, WriteType};
+    use btleplug::platform::{Adapter, Manager, Peripheral};
+    use tokio::runtime::Runtime;
+    use uuid::Uuid;
+
+    use super::*;
+
+    const PWR_SERVICE: Uuid = Uuid::from_u128(0x00001523_1212_efde_1523_785feabcd124);
+    const PWR_CHARACTERISTIC: Uuid = Uuid::from_u128(0x00001525_1212_efde_1523_785feabcd124);
+    /// How long `connect` listens for a base station that the system has not seen yet.
+    const FIND_TIMEOUT: Duration = Duration::from_secs(8);
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+    pub struct BtleRadio {
+        rt: Arc<Runtime>,
+        adapter: Mutex<Option<Adapter>>,
+        /// Stations looking for themselves at once share one scan: it stops with the last one.
+        scanners: Mutex<usize>,
+    }
+
+    impl BtleRadio {
+        pub fn new() -> Self {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name("bluetooth")
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            BtleRadio { rt: Arc::new(rt), adapter: Mutex::new(None), scanners: Mutex::new(0) }
+        }
+
+        /// The first Bluetooth adapter, looked up once and kept.
+        fn adapter(&self) -> Result<Adapter> {
+            let mut slot = self.adapter.lock().unwrap();
+            if let Some(a) = &*slot {
+                return Ok(a.clone());
+            }
+            let a = self.rt.block_on(async {
+                let manager = Manager::new().await?;
+                manager.adapters().await?.into_iter().next().ok_or_else(|| anyhow!("no Bluetooth adapter"))
+            })?;
+            *slot = Some(a.clone());
+            Ok(a)
+        }
+
+        async fn scan_start(&self, adapter: &Adapter) -> Result<()> {
+            let first = {
+                let mut n = self.scanners.lock().unwrap();
+                *n += 1;
+                *n == 1
+            };
+            if first {
+                adapter.start_scan(ScanFilter::default()).await?;
+            }
+            Ok(())
+        }
+
+        async fn scan_stop(&self, adapter: &Adapter) {
+            let last = {
+                let mut n = self.scanners.lock().unwrap();
+                *n = n.saturating_sub(1);
+                *n == 0
+            };
+            if last {
+                let _ = adapter.stop_scan().await;
+            }
+        }
+    }
+
+    /// The station id of a peripheral: its address, or on macOS (no addresses) its name.
+    async fn id_of(p: &Peripheral) -> Option<(Mac, String)> {
+        let props = p.properties().await.ok()??;
+        let name = props.local_name.unwrap_or_default();
+        let mac = if cfg!(target_os = "macos") { Mac::from_name(&name)? } else { Mac(address_u64(&props.address)) };
+        Some((mac, name))
+    }
+
+    fn address_u64(a: &btleplug::api::BDAddr) -> u64 {
+        a.into_inner().iter().fold(0u64, |v, b| (v << 8) | u64::from(*b))
+    }
+
+    async fn find(adapter: &Adapter, mac: Mac) -> Result<Option<Peripheral>> {
+        for p in adapter.peripherals().await? {
+            if id_of(&p).await.is_some_and(|(m, _)| m == mac) {
+                return Ok(Some(p));
+            }
+        }
+        Ok(None)
+    }
+
+    struct BtleLink {
+        rt: Arc<Runtime>,
+        peripheral: Peripheral,
+        characteristic: Characteristic,
+    }
+
+    impl Drop for BtleLink {
+        fn drop(&mut self) {
+            let _ = self.rt.block_on(self.peripheral.disconnect());
+        }
+    }
+
+    impl Link for BtleLink {
+        fn read_power(&mut self) -> Result<u8> {
+            let v = self.rt.block_on(self.peripheral.read(&self.characteristic)).map_err(|e| anyhow!("read: {e}"))?;
+            v.first().copied().ok_or_else(|| anyhow!("read: empty value"))
+        }
+
+        fn write_power(&mut self, value: u8) -> Result<()> {
+            self.rt
+                .block_on(self.peripheral.write(&self.characteristic, &[value], WriteType::WithResponse))
+                .map_err(|e| anyhow!("write: {e}"))
+        }
+    }
+
+    impl Radio for BtleRadio {
+        fn connect(&self, mac: Mac) -> Result<Box<dyn Link>> {
+            let adapter = self.adapter()?;
+            let rt = self.rt.clone();
+            let (peripheral, characteristic) = self.rt.block_on(async {
+                // btleplug only connects to peripherals the system has seen: listen until it shows up.
+                let mut p = find(&adapter, mac).await?;
+                if p.is_none() {
+                    self.scan_start(&adapter).await?;
+                    let start = Instant::now();
+                    while p.is_none() && start.elapsed() < FIND_TIMEOUT {
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        p = find(&adapter, mac).await.unwrap_or(None);
+                    }
+                    self.scan_stop(&adapter).await;
+                }
+                let p = p.ok_or_else(|| anyhow!("not found (no advertisement seen)"))?;
+                if !p.is_connected().await.unwrap_or(false) {
+                    tokio::time::timeout(CONNECT_TIMEOUT, p.connect())
+                        .await
+                        .map_err(|_| anyhow!("connect timed out: device unreachable"))??;
+                }
+                p.discover_services().await?;
+                let c = p
+                    .characteristics()
+                    .into_iter()
+                    .find(|c| c.uuid == PWR_CHARACTERISTIC && c.service_uuid == PWR_SERVICE)
+                    .ok_or_else(|| anyhow!("power service not found — not a Lighthouse V2?"))?;
+                anyhow::Ok((p, c))
+            })?;
+            Ok(Box::new(BtleLink { rt, peripheral, characteristic }))
+        }
+
+        fn scan(&self, duration: Duration) -> Result<Vec<Discovered>> {
+            let adapter = self.adapter()?;
+            self.rt.block_on(async {
+                self.scan_start(&adapter).await?;
+                tokio::time::sleep(duration).await;
+                self.scan_stop(&adapter).await;
+                let mut found: BTreeMap<Mac, Discovered> = BTreeMap::new();
+                for p in adapter.peripherals().await? {
+                    let Some((mac, name)) = id_of(&p).await else { continue };
+                    if !name.starts_with(LHB_PREFIX) {
+                        continue;
+                    }
+                    let rssi = p.properties().await.ok().flatten().and_then(|x| x.rssi).unwrap_or(i16::MIN);
+                    found.insert(mac, Discovered { mac, name, rssi });
+                }
+                Ok(found.into_values().collect())
+            })
         }
     }
 }

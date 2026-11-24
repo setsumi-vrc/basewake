@@ -1,4 +1,5 @@
-//! Build steps: copy the OpenVR runtime DLL next to the executables and give the exe an icon.
+//! Build steps: copy the OpenVR runtime library next to the executables and, on Windows, give
+//! the exe an icon.
 use std::path::PathBuf;
 
 #[path = "src/ui/icons.rs"]
@@ -6,23 +7,35 @@ use std::path::PathBuf;
 mod icons;
 
 fn main() {
-    let src = PathBuf::from("third_party/openvr-2.12.14/openvr_api.dll");
-    println!("cargo:rerun-if-changed={}", src.display());
     println!("cargo:rerun-if-changed=src/ui/icons.rs");
+    // Build scripts run on the host, so ask Cargo which system the binaries are for.
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    // OUT_DIR is target/<profile>/build/<pkg>-<hash>/out → target/<profile> is 3 levels up.
-    if let Some(profile_dir) = out.ancestors().nth(3) {
-        let _ = std::fs::copy(&src, profile_dir.join("openvr_api.dll"));
+
+    let lib = match target_os.as_str() {
+        "windows" => Some("openvr_api.dll"),
+        "linux" => Some("libopenvr_api.so"),
+        _ => None, // no SteamVR on macOS
+    };
+    if let Some(lib) = lib {
+        let src = PathBuf::from("third_party/openvr-2.12.14").join(lib);
+        println!("cargo:rerun-if-changed={}", src.display());
+        // OUT_DIR is target/<profile>/build/<pkg>-<hash>/out → target/<profile> is 3 levels up.
+        if let Some(profile_dir) = out.ancestors().nth(3) {
+            let _ = std::fs::copy(&src, profile_dir.join(lib));
+        }
     }
 
-    let ico = out.join("basewake.ico");
-    std::fs::write(&ico, ico_file(&[16, 32, 48, 256])).unwrap();
-    let mut res = winresource::WindowsResource::new();
-    res.set_icon(ico.to_str().unwrap());
-    res.set("FileDescription", "Basewake");
-    res.set("ProductName", "Basewake");
-    if let Err(e) = res.compile() {
-        println!("cargo:warning=could not embed icon: {e}");
+    if target_os == "windows" {
+        let ico = out.join("basewake.ico");
+        std::fs::write(&ico, ico_file(&[16, 32, 48, 256])).unwrap();
+        let mut res = winresource::WindowsResource::new();
+        res.set_icon(ico.to_str().unwrap());
+        res.set("FileDescription", "Basewake");
+        res.set("ProductName", "Basewake");
+        if let Err(e) = res.compile() {
+            println!("cargo:warning=could not embed icon: {e}");
+        }
     }
 }
 

@@ -1,4 +1,5 @@
-//! Minimal OpenVR bindings: loads `openvr_api.dll` next to the exe and uses the C function
+//! Minimal OpenVR bindings: loads the OpenVR runtime library (`openvr_api.dll`,
+//! `libopenvr_api.so`) next to the exe and uses the C function
 //! tables (`FnTable:IVR…`) from OpenVR SDK 2.12.14 (`third_party/openvr-2.12.14/openvr_capi.h`).
 //! Only the handful of calls this app needs are typed; the other table slots are padding.
 
@@ -29,17 +30,24 @@ pub const FLAG_SEND_DISCRETE_SCROLL: i32 = 64;
 pub const TEXTURE_OPENGL: i32 = 1;
 pub const COLOR_SPACE_AUTO: i32 = 0;
 
-/// `VREvent_t` (64 bytes on Win64; data union at offset 16 — checked against the SDK header).
+/// `VREvent_t`. On Windows it is 64 bytes with the data union at offset 16; on Linux OpenVR
+/// packs its structs to 4 bytes, so it is 60 bytes with the union at offset 12 (both checked
+/// against the SDK header).
 #[repr(C)]
+#[cfg_attr(windows, repr(align(8)))]
 #[derive(Clone, Copy)]
 pub struct VrEvent {
     pub event_type: u32,
     pub tracked_device_index: u32,
     pub event_age_seconds: f32,
+    #[cfg(windows)]
     _pad: u32,
-    pub data: [u64; 6],
+    pub data: [u32; 12],
 }
+#[cfg(windows)]
 const _: () = assert!(std::mem::size_of::<VrEvent>() == 64);
+#[cfg(not(windows))]
+const _: () = assert!(std::mem::size_of::<VrEvent>() == 60);
 
 impl Default for VrEvent {
     fn default() -> Self {
@@ -49,12 +57,10 @@ impl Default for VrEvent {
 
 impl VrEvent {
     fn f32_at(&self, i: usize) -> f32 {
-        let bytes: [u8; 48] = unsafe { std::mem::transmute(self.data) };
-        f32::from_ne_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
+        f32::from_bits(self.data[i])
     }
     fn u32_at(&self, i: usize) -> u32 {
-        let bytes: [u8; 48] = unsafe { std::mem::transmute(self.data) };
-        u32::from_ne_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
+        self.data[i]
     }
     /// `VREvent_Mouse_t`: x, y (GL space: bottom-left is 0,0), button.
     pub fn mouse(&self) -> (f32, f32, u32) {
@@ -151,17 +157,26 @@ pub struct OpenVr {
 // The tables are plain function pointers; access is serialised by the callers.
 unsafe impl Send for OpenVr {}
 
+/// The OpenVR runtime library shipped next to the executable.
+#[cfg(windows)]
+pub const LIBRARY: &str = "openvr_api.dll";
+#[cfg(not(windows))]
+pub const LIBRARY: &str = "libopenvr_api.so";
+
 fn dll_path() -> std::path::PathBuf {
     std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join("openvr_api.dll")))
-        .unwrap_or_else(|| "openvr_api.dll".into())
+        .and_then(|p| p.parent().map(|d| d.join(LIBRARY)))
+        .unwrap_or_else(|| LIBRARY.into())
 }
 
 /// Only one OpenVR context may exist per process.
 static LOCK: Mutex<()> = Mutex::new(());
 
 fn load() -> Result<Library> {
+    if !super::SUPPORTED {
+        bail!("SteamVR is not available on this system");
+    }
     let path = dll_path();
     unsafe { Library::new(&path) }.with_context(|| format!("cannot load {}", path.display()))
 }

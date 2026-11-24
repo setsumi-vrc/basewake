@@ -1,7 +1,6 @@
 //! The "Basewake" panel in the SteamVR dashboard: the same egui panel as the desktop window,
 //! rendered off-screen with OpenGL into a texture and handed to the dashboard overlay.
 
-use std::ffi::{CString, c_void};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -9,19 +8,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, anyhow, bail};
 use eframe::egui;
 use glow::HasContext;
-use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::Graphics::Gdi::{GetDC, HDC, ReleaseDC};
-use windows::Win32::Graphics::OpenGL::{
-    ChoosePixelFormat, HGLRC, PFD_DOUBLEBUFFER, PFD_DRAW_TO_WINDOW, PFD_MAIN_PLANE, PFD_SUPPORT_OPENGL,
-    PFD_TYPE_RGBA, PIXELFORMATDESCRIPTOR, SetPixelFormat, wglCreateContext, wglDeleteContext, wglGetProcAddress,
-    wglMakeCurrent,
-};
-use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
-use windows::Win32::UI::WindowsAndMessaging::{
-    CS_OWNDC, CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, WINDOW_EX_STYLE, WNDCLASSW,
-    WS_OVERLAPPEDWINDOW,
-};
-use windows::core::{PCSTR, w};
 
 use super::openvr::{self, OpenVr, OverlayHandle};
 use crate::app::AppCtl;
@@ -193,13 +179,40 @@ impl Dashboard {
             self.gl.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
             self.gl.gl.finish();
         }
-        vr.set_gl_texture(self.main, self.texture.0.get())?;
+        self.submit(vr)?;
 
         let now = Instant::now();
         self.last_paint = Some(now);
         let delay = out.viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.repaint_delay).unwrap_or(Duration::MAX);
         self.next_paint = (delay < Duration::from_secs(3600)).then(|| now + delay.max(MIN_FRAME));
         Ok(())
+    }
+
+    /// Hands the rendered frame to the overlay: the GL texture itself on Windows; elsewhere the
+    /// pixels, because SteamVR's Linux compositor cannot use a texture from an EGL context.
+    #[cfg(windows)]
+    fn submit(&self, vr: &OpenVr) -> Result<()> {
+        vr.set_gl_texture(self.main, self.texture.0.get())
+    }
+
+    #[cfg(not(windows))]
+    fn submit(&self, vr: &OpenVr) -> Result<()> {
+        let row = WIDTH as usize * 4;
+        let mut px = vec![0u8; row * HEIGHT as usize];
+        unsafe {
+            self.gl.gl.read_pixels(
+                0,
+                0,
+                WIDTH as i32,
+                HEIGHT as i32,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut px)),
+            );
+        }
+        // GL rows run bottom-up; the overlay wants the top row first.
+        let flipped: Vec<u8> = px.chunks_exact(row).rev().flatten().copied().collect();
+        vr.set_raw(self.main, &flipped, WIDTH, HEIGHT)
     }
 
     fn update_thumbnail(&mut self, vr: &OpenVr, tone: ui::icons::Tone) {
@@ -250,92 +263,213 @@ unsafe fn create_target(gl: &glow::Context) -> Result<(glow::Framebuffer, glow::
     }
 }
 
-/// An OpenGL context on a hidden window, current on the SteamVR thread.
-struct GlContext {
-    hwnd: HWND,
-    hdc: HDC,
-    hglrc: HGLRC,
-    gl: Arc<glow::Context>,
-}
+#[cfg(windows)]
+use gl_wgl::GlContext;
+#[cfg(target_os = "linux")]
+use gl_egl::GlContext;
+#[cfg(not(any(windows, target_os = "linux")))]
+use gl_none::GlContext;
 
-impl GlContext {
-    fn new() -> Result<GlContext> {
-        unsafe extern "system" fn wndproc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-            unsafe { DefWindowProcW(h, m, w, l) }
-        }
-        unsafe {
-            let hinstance = GetModuleHandleW(None)?;
-            let class = w!("BasewakeGL");
-            let wc = WNDCLASSW {
-                style: CS_OWNDC,
-                lpfnWndProc: Some(wndproc),
-                hInstance: hinstance.into(),
-                lpszClassName: class,
-                ..Default::default()
-            };
-            RegisterClassW(&wc); // fails harmlessly if already registered
-            let hwnd = CreateWindowExW(
-                WINDOW_EX_STYLE::default(),
-                class,
-                w!("Basewake GL"),
-                WS_OVERLAPPEDWINDOW,
-                0,
-                0,
-                16,
-                16,
-                None,
-                None,
-                Some(hinstance.into()),
-                None,
-            )?;
-            let hdc = GetDC(Some(hwnd));
-            let pfd = PIXELFORMATDESCRIPTOR {
-                nSize: std::mem::size_of::<PIXELFORMATDESCRIPTOR>() as u16,
-                nVersion: 1,
-                dwFlags: PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER,
-                iPixelType: PFD_TYPE_RGBA,
-                cColorBits: 32,
-                cAlphaBits: 8,
-                cDepthBits: 24,
-                cStencilBits: 8,
-                iLayerType: PFD_MAIN_PLANE.0 as u8,
-                ..Default::default()
-            };
-            let format = ChoosePixelFormat(hdc, &pfd);
-            if format == 0 {
-                bail!("no OpenGL pixel format");
+#[cfg(windows)]
+mod gl_wgl {
+    use std::ffi::{CString, c_void};
+    use std::sync::Arc;
+
+    use anyhow::{Result, bail};
+    use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Graphics::Gdi::{GetDC, HDC, ReleaseDC};
+    use windows::Win32::Graphics::OpenGL::{
+        ChoosePixelFormat, HGLRC, PFD_DOUBLEBUFFER, PFD_DRAW_TO_WINDOW, PFD_MAIN_PLANE, PFD_SUPPORT_OPENGL,
+        PFD_TYPE_RGBA, PIXELFORMATDESCRIPTOR, SetPixelFormat, wglCreateContext, wglDeleteContext,
+        wglGetProcAddress, wglMakeCurrent,
+    };
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CS_OWNDC, CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, WINDOW_EX_STYLE, WNDCLASSW,
+        WS_OVERLAPPEDWINDOW,
+    };
+    use windows::core::{PCSTR, w};
+
+    /// An OpenGL context on a hidden window, current on the SteamVR thread.
+    pub struct GlContext {
+        hwnd: HWND,
+        hdc: HDC,
+        hglrc: HGLRC,
+        pub gl: Arc<glow::Context>,
+    }
+
+    impl GlContext {
+        pub fn new() -> Result<GlContext> {
+            unsafe extern "system" fn wndproc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+                unsafe { DefWindowProcW(h, m, w, l) }
             }
-            SetPixelFormat(hdc, format, &pfd)?;
-            let hglrc = wglCreateContext(hdc)?;
-            wglMakeCurrent(hdc, hglrc)?;
-
-            let opengl32: HMODULE = LoadLibraryW(w!("opengl32.dll"))?;
-            let gl = glow::Context::from_loader_function(|name| {
-                let c = CString::new(name).unwrap();
-                let p = wglGetProcAddress(PCSTR(c.as_ptr().cast()));
-                let addr = p.map(|f| f as usize).unwrap_or(0);
-                // wglGetProcAddress returns small sentinel values for core 1.1 functions.
-                if addr > 3 && addr != usize::MAX {
-                    return addr as *const c_void;
+            unsafe {
+                let hinstance = GetModuleHandleW(None)?;
+                let class = w!("BasewakeGL");
+                let wc = WNDCLASSW {
+                    style: CS_OWNDC,
+                    lpfnWndProc: Some(wndproc),
+                    hInstance: hinstance.into(),
+                    lpszClassName: class,
+                    ..Default::default()
+                };
+                RegisterClassW(&wc); // fails harmlessly if already registered
+                let hwnd = CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    class,
+                    w!("Basewake GL"),
+                    WS_OVERLAPPEDWINDOW,
+                    0,
+                    0,
+                    16,
+                    16,
+                    None,
+                    None,
+                    Some(hinstance.into()),
+                    None,
+                )?;
+                let hdc = GetDC(Some(hwnd));
+                let pfd = PIXELFORMATDESCRIPTOR {
+                    nSize: std::mem::size_of::<PIXELFORMATDESCRIPTOR>() as u16,
+                    nVersion: 1,
+                    dwFlags: PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER,
+                    iPixelType: PFD_TYPE_RGBA,
+                    cColorBits: 32,
+                    cAlphaBits: 8,
+                    cDepthBits: 24,
+                    cStencilBits: 8,
+                    iLayerType: PFD_MAIN_PLANE.0 as u8,
+                    ..Default::default()
+                };
+                let format = ChoosePixelFormat(hdc, &pfd);
+                if format == 0 {
+                    bail!("no OpenGL pixel format");
                 }
-                GetProcAddress(opengl32, PCSTR(c.as_ptr().cast())).map(|f| f as usize).unwrap_or(0) as *const c_void
-            });
-            Ok(GlContext { hwnd, hdc, hglrc, gl: Arc::new(gl) })
+                SetPixelFormat(hdc, format, &pfd)?;
+                let hglrc = wglCreateContext(hdc)?;
+                wglMakeCurrent(hdc, hglrc)?;
+
+                let opengl32: HMODULE = LoadLibraryW(w!("opengl32.dll"))?;
+                let gl = glow::Context::from_loader_function(|name| {
+                    let c = CString::new(name).unwrap();
+                    let p = wglGetProcAddress(PCSTR(c.as_ptr().cast()));
+                    let addr = p.map(|f| f as usize).unwrap_or(0);
+                    // wglGetProcAddress returns small sentinel values for core 1.1 functions.
+                    if addr > 3 && addr != usize::MAX {
+                        return addr as *const c_void;
+                    }
+                    GetProcAddress(opengl32, PCSTR(c.as_ptr().cast())).map(|f| f as usize).unwrap_or(0)
+                        as *const c_void
+                });
+                Ok(GlContext { hwnd, hdc, hglrc, gl: Arc::new(gl) })
+            }
+        }
+
+        pub fn make_current(&self) -> Result<()> {
+            unsafe { wglMakeCurrent(self.hdc, self.hglrc).map_err(Into::into) }
         }
     }
 
-    fn make_current(&self) -> Result<()> {
-        unsafe { wglMakeCurrent(self.hdc, self.hglrc).map_err(Into::into) }
+    impl Drop for GlContext {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = wglMakeCurrent(HDC::default(), HGLRC::default());
+                let _ = wglDeleteContext(self.hglrc);
+                ReleaseDC(Some(self.hwnd), self.hdc);
+                let _ = DestroyWindow(self.hwnd);
+            }
+        }
     }
 }
 
-impl Drop for GlContext {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = wglMakeCurrent(HDC::default(), HGLRC::default());
-            let _ = wglDeleteContext(self.hglrc);
-            ReleaseDC(Some(self.hwnd), self.hdc);
-            let _ = DestroyWindow(self.hwnd);
+#[cfg(target_os = "linux")]
+mod gl_egl {
+    use std::sync::Arc;
+
+    use anyhow::{Context as _, Result, anyhow};
+    use khronos_egl as egl;
+
+    /// A headless OpenGL context (EGL pbuffer), current on the SteamVR thread. libEGL is loaded
+    /// at run time, so Basewake still starts on systems without it.
+    pub struct GlContext {
+        egl: egl::DynamicInstance<egl::EGL1_4>,
+        display: egl::Display,
+        surface: egl::Surface,
+        context: egl::Context,
+        pub gl: Arc<glow::Context>,
+    }
+
+    impl GlContext {
+        pub fn new() -> Result<GlContext> {
+            let egl = unsafe { egl::DynamicInstance::<egl::EGL1_4>::load_required() }
+                .map_err(|e| anyhow!("cannot load libEGL: {e}"))?;
+            let display = unsafe { egl.get_display(egl::DEFAULT_DISPLAY) }.context("no EGL display")?;
+            egl.initialize(display).context("eglInitialize")?;
+            egl.bind_api(egl::OPENGL_API).context("eglBindAPI")?;
+            let attrs = [
+                egl::SURFACE_TYPE,
+                egl::PBUFFER_BIT,
+                egl::RENDERABLE_TYPE,
+                egl::OPENGL_BIT,
+                egl::RED_SIZE,
+                8,
+                egl::GREEN_SIZE,
+                8,
+                egl::BLUE_SIZE,
+                8,
+                egl::ALPHA_SIZE,
+                8,
+                egl::NONE,
+            ];
+            let config =
+                egl.choose_first_config(display, &attrs).context("eglChooseConfig")?.context("no EGL config")?;
+            let surface = egl
+                .create_pbuffer_surface(display, config, &[egl::WIDTH, 16, egl::HEIGHT, 16, egl::NONE])
+                .context("eglCreatePbufferSurface")?;
+            let context = egl.create_context(display, config, None, &[egl::NONE]).context("eglCreateContext")?;
+            egl.make_current(display, Some(surface), Some(surface), Some(context)).context("eglMakeCurrent")?;
+            let gl = unsafe {
+                glow::Context::from_loader_function(|name| {
+                    egl.get_proc_address(name).map(|f| f as *const std::ffi::c_void).unwrap_or(std::ptr::null())
+                })
+            };
+            Ok(GlContext { egl, display, surface, context, gl: Arc::new(gl) })
+        }
+
+        pub fn make_current(&self) -> Result<()> {
+            self.egl
+                .make_current(self.display, Some(self.surface), Some(self.surface), Some(self.context))
+                .context("eglMakeCurrent")
+        }
+    }
+
+    impl Drop for GlContext {
+        fn drop(&mut self) {
+            let _ = self.egl.make_current(self.display, None, None, None);
+            let _ = self.egl.destroy_context(self.display, self.context);
+            let _ = self.egl.destroy_surface(self.display, self.surface);
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+mod gl_none {
+    use std::sync::Arc;
+
+    use anyhow::{Result, bail};
+
+    /// No SteamVR here, so no panel to render.
+    pub struct GlContext {
+        pub gl: Arc<glow::Context>,
+    }
+
+    impl GlContext {
+        pub fn new() -> Result<GlContext> {
+            bail!("the SteamVR panel is not available on this system")
+        }
+
+        pub fn make_current(&self) -> Result<()> {
+            Ok(())
         }
     }
 }

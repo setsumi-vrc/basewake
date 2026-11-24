@@ -341,6 +341,18 @@ fn settings(ui: &mut egui::Ui, ctl: &Arc<AppCtl>, cfg: &Config, vr: &VrStatus) {
         }
     });
 
+    if crate::vr::SUPPORTED {
+        steamvr_settings(ui, ctl, cfg, vr);
+    }
+    bool_row(ui, ctl, "Manage new base stations automatically", cfg.auto_enable_new, |c, v| c.auto_enable_new = v);
+
+    ui.add_space(14.0);
+    if text_button(ui, "Open settings and logs folder", true).clicked() {
+        crate::desktop::chrome::open_in_browser(&Config::dir().to_string_lossy());
+    }
+}
+
+fn steamvr_settings(ui: &mut egui::Ui, ctl: &Arc<AppCtl>, cfg: &Config, vr: &VrStatus) {
     let registered = vr.registered.unwrap_or(false);
     let note = match (&vr.error, vr.registered) {
         (Some(e), _) => Some(e.clone()),
@@ -357,13 +369,7 @@ fn settings(ui: &mut egui::Ui, ctl: &Arc<AppCtl>, cfg: &Config, vr: &VrStatus) {
     });
 
     bool_row(ui, ctl, "Find new base stations when SteamVR starts", cfg.scan_on_start, |c, v| c.scan_on_start = v);
-    bool_row(ui, ctl, "Manage new base stations automatically", cfg.auto_enable_new, |c, v| c.auto_enable_new = v);
     bool_row(ui, ctl, "Quit when SteamVR closes", cfg.close_with_steamvr, |c, v| c.close_with_steamvr = v);
-
-    ui.add_space(14.0);
-    if text_button(ui, "Open settings and logs folder", true).clicked() {
-        let _ = std::process::Command::new("explorer.exe").arg(Config::dir()).spawn();
-    }
 }
 
 fn setting_row(ui: &mut egui::Ui, label: &str, note: Option<&str>, control: impl FnOnce(&mut egui::Ui)) {

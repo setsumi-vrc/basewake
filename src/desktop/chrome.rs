@@ -197,7 +197,7 @@ fn focus(ui: &Ui, resp: &Response, rect: Rect) {
     }
 }
 
-/// Opens a link in the default browser.
+/// Opens a link in the default browser, or a folder in the file manager.
 pub fn open_in_browser(url: &str) {
     #[cfg(windows)]
     let cmd = std::process::Command::new("explorer").arg(url).spawn();

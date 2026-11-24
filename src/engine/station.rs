@@ -58,13 +58,22 @@ impl fmt::Display for PowerState {
     }
 }
 
-/// A 48-bit Bluetooth address, stored as WinRT expects it (u64, big-endian byte order).
+/// Identifies a base station. Normally its 48-bit Bluetooth address (u64, big-endian byte
+/// order, as WinRT and BlueZ give it). macOS never exposes addresses, so there it is the hex
+/// part of the advertised name (`LHB-278AF87D`), which is unique per base station; such ids
+/// carry the `NAME_ID` marker in the top byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Mac(pub u64);
 
 impl Mac {
+    const NAME_ID: u64 = 0xFF << 56;
+
     pub fn parse(s: &str) -> Option<Mac> {
-        let parts: Vec<&str> = s.trim().split([':', '-']).collect();
+        let s = s.trim();
+        if let Some(hex) = s.strip_prefix(crate::engine::ble::LHB_PREFIX) {
+            return Mac::from_name_hex(hex);
+        }
+        let parts: Vec<&str> = s.split([':', '-']).collect();
         if parts.len() != 6 {
             return None;
         }
@@ -77,10 +86,30 @@ impl Mac {
         }
         Some(Mac(v))
     }
+
+    /// The id for an advertised name like `LHB-278AF87D` (macOS).
+    pub fn from_name(name: &str) -> Option<Mac> {
+        Mac::from_name_hex(name.trim().strip_prefix(crate::engine::ble::LHB_PREFIX)?)
+    }
+
+    fn from_name_hex(hex: &str) -> Option<Mac> {
+        if hex.is_empty() || hex.len() > 8 {
+            return None;
+        }
+        Some(Mac(Mac::NAME_ID | u64::from_str_radix(hex, 16).ok()?))
+    }
+
+    /// True for ids made from the name rather than the Bluetooth address.
+    pub fn is_name_id(self) -> bool {
+        self.0 & Mac::NAME_ID == Mac::NAME_ID
+    }
 }
 
 impl fmt::Display for Mac {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_name_id() {
+            return write!(f, "{}{:08X}", crate::engine::ble::LHB_PREFIX, self.0 & 0xFFFF_FFFF);
+        }
         let b = self.0.to_be_bytes();
         write!(
             f,
@@ -100,6 +129,17 @@ mod tests {
         assert_eq!(m.0, 0xE155D1676698);
         assert_eq!(m.to_string(), "E1:55:D1:67:66:98");
         assert_eq!(Mac::parse("e1-55-d1-67-66-98"), Some(m));
+    }
+
+    #[test]
+    fn name_ids_roundtrip_and_stay_apart_from_addresses() {
+        let m = Mac::from_name("LHB-278AF87D").unwrap();
+        assert!(m.is_name_id());
+        assert_eq!(m.to_string(), "LHB-278AF87D");
+        assert_eq!(Mac::parse("LHB-278AF87D"), Some(m));
+        assert!(!Mac::parse("E1:55:D1:67:66:98").unwrap().is_name_id());
+        assert!(Mac::from_name("LHB-").is_none());
+        assert!(Mac::from_name("LHB-XYZ").is_none());
     }
 
     #[test]

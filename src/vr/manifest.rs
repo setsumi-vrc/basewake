@@ -98,7 +98,10 @@ pub fn unregister() -> Result<()> {
 /// Reads SteamVR's own config files to tell whether we are registered and set to auto-launch.
 /// Never starts SteamVR. `None` if the files cannot be read.
 pub fn registered_from_files() -> Option<bool> {
-    let vrpath = directories::BaseDirs::new()?.data_local_dir().join("openvr").join("openvrpaths.vrpath");
+    // %LOCALAPPDATA%\openvr on Windows, ~/.config/openvr on Linux.
+    let dirs = directories::BaseDirs::new()?;
+    let base = if cfg!(windows) { dirs.data_local_dir() } else { dirs.config_dir() };
+    let vrpath = base.join("openvr").join("openvrpaths.vrpath");
     let paths: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(vrpath).ok()?).ok()?;
     let config_dir = PathBuf::from(paths["config"].as_array()?.first()?.as_str()?);
 

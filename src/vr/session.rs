@@ -100,6 +100,7 @@ fn connect(ctl: &Arc<AppCtl>) -> Option<Arc<Mutex<OpenVr>>> {
 
 /// Starts `basewake.exe --local off` as an independent process (outside SteamVR's job when
 /// allowed), so the base stations get turned off even if this process is killed.
+#[cfg(windows)]
 pub fn spawn_detached_off() {
     use std::os::windows::process::CommandExt;
     use std::process::{Command as Proc, Stdio};
@@ -120,6 +121,27 @@ pub fn spawn_detached_off() {
     };
     let base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
     match spawn(base | CREATE_BREAKAWAY_FROM_JOB).or_else(|_| spawn(base)) {
+        Ok(child) => tracing::info!("turning base stations off in process {}", child.id()),
+        Err(e) => tracing::error!("could not start the turn-off process: {e}"),
+    }
+}
+
+/// Starts `basewake --local off` in its own process group, so the base stations get turned off
+/// even if SteamVR takes this process down with its own group.
+#[cfg(unix)]
+pub fn spawn_detached_off() {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command as Proc, Stdio};
+
+    let Ok(exe) = std::env::current_exe() else { return };
+    let child = Proc::new(&exe)
+        .args(["--local", "off"])
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    match child {
         Ok(child) => tracing::info!("turning base stations off in process {}", child.id()),
         Err(e) => tracing::error!("could not start the turn-off process: {e}"),
     }

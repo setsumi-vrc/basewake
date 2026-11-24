@@ -1,4 +1,4 @@
-//! Logging to `%APPDATA%\Basewake\logs\basewake.log.<date>` (and stderr for the CLI).
+//! Logging to `<config dir>/logs/basewake.log.<date>` (and stderr for the CLI).
 
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::fmt::writer::MakeWriterExt;
