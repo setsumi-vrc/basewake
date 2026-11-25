@@ -12,10 +12,10 @@ Bluetooth. No PC needed.
 
 1. Open the latest successful [android workflow run](https://github.com/setsumi-vrc/basewake/actions/workflows/android.yml)
    and download the `basewake-android` artifact.
-2. Unzip it and copy `basewake-0.1.0-debug.apk` to your phone.
+2. Unzip it and copy `debug/basewake-0.1.0-debug.apk` to your phone.
 3. Open it and allow installing from that source when Android asks.
 
-The `-release-unsigned.apk` in the same artifact is not signed and won't install as is.
+The `release/` APK in the same artifact is not signed and won't install as is.
 
 Needs Android 8.0 or newer with Bluetooth LE.
 
