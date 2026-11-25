@@ -4,6 +4,13 @@ All notable changes to Basewake are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- The tray popup's menu rows now light up under the mouse; the highlight was the same colour as
+  the popup.
+
 ## [0.1.0] - 2026-11-24
 
 First release.

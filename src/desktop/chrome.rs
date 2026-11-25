@@ -222,8 +222,9 @@ pub fn menu_item(ui: &mut Ui, text: &str, enabled: bool) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), sense);
     resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, text));
     let p = ui.painter();
+    // The popup itself is RAISED, so the highlight is one step lighter.
     if enabled && (resp.hovered() || resp.has_focus()) {
-        p.rect_filled(rect, CornerRadius::same(6), RAISED);
+        p.rect_filled(rect, CornerRadius::same(6), HAIRLINE);
     }
     p.text(
         pos2(rect.left() + 8.0, rect.center().y),
